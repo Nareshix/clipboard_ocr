@@ -8,9 +8,16 @@ use std::process::Command;
 use std::time::Duration;
 
 #[derive(Clone)]
+struct OcrChar {
+    text: char, // We now store the actual character Tesseract saw
+    rect: egui::Rect,
+}
+
+#[derive(Clone)]
 struct OcrWord {
     text: String,
     rect: egui::Rect,
+    chars: Vec<OcrChar>,
 }
 
 struct ClipImage {
@@ -41,7 +48,7 @@ impl eframe::App for ClipboardManagerApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("📋 Smart Clipboard with Tesseract OCR");
+            ui.heading("📋 Smart Clipboard with True Character Highlighting");
             ui.add_space(8.0);
 
             ui.horizontal(|ui| {
@@ -56,7 +63,6 @@ impl eframe::App for ClipboardManagerApp {
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let search_lower = self.search_query.to_lowercase();
-                // Split search into individual words
                 let search_terms: Vec<&str> = search_lower.split_whitespace().collect();
 
                 for clip in self.clips.iter_mut().rev() {
@@ -125,9 +131,7 @@ fn start_clipboard_poller(sender: Sender<Clip>, ctx: egui::Context) {
                 let hash = hash_bytes(&img.bytes);
                 if hash != last_img_hash {
                     last_img_hash = hash;
-
                     let words = perform_ocr_on_image(&img);
-
                     let _ = sender.send(Clip::Image(ClipImage {
                         rgba: img.bytes.into_owned(),
                         size: [img.width, img.height],
@@ -145,55 +149,135 @@ fn start_clipboard_poller(sender: Sender<Clip>, ctx: egui::Context) {
 fn perform_ocr_on_image(img: &arboard::ImageData) -> Vec<OcrWord> {
     let buffer: RgbaImage = ImageBuffer::from_raw(img.width as u32, img.height as u32, img.bytes.to_vec())
         .expect("Failed to parse image buffer");
+
     let temp_img_path = std::env::temp_dir().join("clipboard_ocr_temp.png");
     buffer.save(&temp_img_path).ok();
+    let img_h = img.height as f32;
 
-    println!("[OCR] Running Tesseract on new image...");
+    println!("[OCR] Running Tesseract (Two-Pass Parallel)...");
 
-    let output = Command::new("tesseract")
-        .arg(&temp_img_path)
-        .arg("stdout")
-        .arg("tsv")
-        .output();
+    let path_1 = temp_img_path.clone();
+    let tsv_thread = std::thread::spawn(move || {
+        Command::new("tesseract").arg(&path_1).arg("stdout").arg("tsv").output()
+    });
+
+    let path_2 = temp_img_path.clone();
+    let mb_thread = std::thread::spawn(move || {
+        Command::new("tesseract").arg(&path_2).arg("stdout").arg("makebox").output()
+    });
+
+    let tsv_output = tsv_thread.join().unwrap();
+    let mb_output = mb_thread.join().unwrap();
 
     let mut words = Vec::new();
+    let mut all_chars = Vec::new();
 
-    match output {
-        Ok(out) => {
-            if !out.status.success() {
-                let err_msg = String::from_utf8_lossy(&out.stderr);
-                println!("[OCR ERROR] Tesseract failed: {}", err_msg);
-                return words;
+    // 1. Parse Character Boxes (Makebox)
+    if let Ok(out) = mb_output {
+        let mb_str = String::from_utf8_lossy(&out.stdout);
+        for line in mb_str.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 5 {
+                // Grab the actual character recognized in this box!
+                let char_text = parts[0].chars().next().unwrap_or(' ');
+
+                let left = parts[1].parse::<f32>().unwrap_or(0.0);
+                let bottom = parts[2].parse::<f32>().unwrap_or(0.0);
+                let right = parts[3].parse::<f32>().unwrap_or(0.0);
+                let top = parts[4].parse::<f32>().unwrap_or(0.0);
+
+                let y_min = img_h - top;
+                let y_max = img_h - bottom;
+
+                all_chars.push(OcrChar {
+                    text: char_text,
+                    rect: egui::Rect::from_min_max(
+                        egui::pos2(left, y_min),
+                        egui::pos2(right, y_max),
+                    ),
+                });
             }
+        }
+    }
 
-            let tsv = String::from_utf8_lossy(&out.stdout);
-            for line in tsv.lines().skip(1) {
-                let cols: Vec<&str> = line.split('\t').collect();
-                if cols.len() >= 12 {
-                    let conf = cols[10].parse::<f32>().unwrap_or(-1.0);
-                    if conf > 10.0 {
-                        let text = cols[11].trim().to_string();
-                        if !text.is_empty() {
-                            let x = cols[6].parse::<f32>().unwrap_or(0.0);
-                            let y = cols[7].parse::<f32>().unwrap_or(0.0);
-                            let w = cols[8].parse::<f32>().unwrap_or(0.0);
-                            let h = cols[9].parse::<f32>().unwrap_or(0.0);
+    // 2. Parse Word Boxes (TSV)
+    if let Ok(out) = tsv_output {
+        let tsv_str = String::from_utf8_lossy(&out.stdout);
+        for line in tsv_str.lines().skip(1) {
+            let cols: Vec<&str> = line.split('\t').collect();
+            if cols.len() >= 12 {
+                let conf = cols[10].parse::<f32>().unwrap_or(-1.0);
+                if conf > 10.0 {
+                    let text = cols[11].trim().to_string();
+                    if !text.is_empty() {
+                        let x = cols[6].parse::<f32>().unwrap_or(0.0);
+                        let y = cols[7].parse::<f32>().unwrap_or(0.0);
+                        let w = cols[8].parse::<f32>().unwrap_or(0.0);
+                        let h = cols[9].parse::<f32>().unwrap_or(0.0);
 
-                            words.push(OcrWord {
-                                text,
-                                rect: egui::Rect::from_min_size(
-                                    egui::pos2(x, y),
-                                    egui::vec2(w, h),
-                                ),
-                            });
-                        }
+                        words.push(OcrWord {
+                            text,
+                            rect: egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h)),
+                            chars: Vec::new(),
+                        });
                     }
                 }
             }
         }
-        Err(e) => {
-            println!("\n[CRITICAL ERROR] Failed to execute 'tesseract' command!");
-            println!("Reason: {}", e);
+    }
+
+    // 3. Map & Align Characters (The Magic Fix for Icons)
+    for word in &mut words {
+        let capture_box = word.rect.expand(4.0);
+        let mut raw_chars = Vec::new();
+
+        for ch in &all_chars {
+            if capture_box.contains(ch.rect.center()) {
+                raw_chars.push(ch.clone());
+            }
+        }
+        raw_chars.sort_by(|a, b| a.rect.min.x.partial_cmp(&b.rect.min.x).unwrap());
+
+        // We run a sequence alignment to ignore noise boxes (like the Rust Icon)
+        let mut aligned_chars = Vec::new();
+        let tsv_chars: Vec<char> = word.text.chars().collect();
+        let mut mb_idx = 0;
+
+        for &tc in &tsv_chars {
+            let mut found = false;
+            let tc_lower = tc.to_lowercase().next().unwrap_or(tc);
+
+            // Scan forward in the raw characters to find the matching letter
+            while mb_idx < raw_chars.len() {
+                let mc_lower = raw_chars[mb_idx].text.to_lowercase().next().unwrap_or(raw_chars[mb_idx].text);
+
+                // If the letters match, we've found the true bounding box for this letter!
+                if mc_lower == tc_lower {
+                    aligned_chars.push(raw_chars[mb_idx].clone());
+                    mb_idx += 1;
+                    found = true;
+                    break;
+                }
+                mb_idx += 1; // Skip non-matching boxes (like the Rust icon!)
+            }
+
+            if !found {
+                break; // Mismatch between passes
+            }
+        }
+
+        // If we perfectly aligned every letter in the word...
+        if aligned_chars.len() == tsv_chars.len() {
+            word.chars = aligned_chars;
+
+            // Fix the word's bounding box! By rebuilding it entirely from the matching
+            // letters, we mathematically amputate the Rust icon out of the selection entirely!
+            let min_x = word.chars.iter().map(|c| c.rect.min.x).fold(f32::INFINITY, f32::min);
+            let max_x = word.chars.iter().map(|c| c.rect.max.x).fold(f32::NEG_INFINITY, f32::max);
+            let min_y = word.chars.iter().map(|c| c.rect.min.y).fold(f32::INFINITY, f32::min);
+            let max_y = word.chars.iter().map(|c| c.rect.max.y).fold(f32::NEG_INFINITY, f32::max);
+
+            word.rect = egui::Rect::from_min_max(egui::pos2(min_x, min_y), egui::pos2(max_x, max_y));
         }
     }
 
@@ -278,38 +362,47 @@ fn render_image_card(ui: &mut egui::Ui, img_clip: &mut ClipImage, search_terms: 
             for word in &img_clip.words {
                 let w_lower = word.text.to_lowercase();
 
-                // For every word you type in the search bar
                 for &term in search_terms {
                     let mut start_idx = 0;
 
-                    // While the search term is found inside the OCR word
                     while let Some(idx) = w_lower[start_idx..].find(term) {
                         let match_start = start_idx + idx;
                         let match_end = match_start + term.len();
 
-                        // --- SUB-WORD FRACTION MATH ---
-                        // Count characters to find the mathematical ratio of the word
-                        let total_chars = word.text.chars().count() as f32;
-                        let start_char_idx = w_lower[..match_start].chars().count() as f32;
-                        let end_char_idx = w_lower[..match_end].chars().count() as f32;
+                        let total_chars = word.text.chars().count();
+                        let start_char_idx = w_lower[..match_start].chars().count();
+                        let end_char_idx = w_lower[..match_end].chars().count();
 
-                        // e.g. If "gi" starts at char 1 out of 10, start_frac is 0.1
-                        let start_frac = start_char_idx / total_chars;
-                        let end_frac = end_char_idx / total_chars;
+                        let highlight_rect = if word.chars.len() == total_chars {
+                            let start_box = &word.chars[start_char_idx];
+                            let end_box = &word.chars[end_char_idx - 1];
 
-                        // Apply the UI scaling to the Tesseract bounding box
-                        let base_min_x = word.rect.min.x * scale_x;
-                        let base_w = word.rect.width() * scale_x;
-                        let y_min = word.rect.min.y * scale_y;
-                        let y_max = word.rect.max.y * scale_y;
+                            let base_min_x = start_box.rect.min.x * scale_x;
+                            let base_max_x = end_box.rect.max.x * scale_x;
+                            let y_min = word.rect.min.y * scale_y;
+                            let y_max = word.rect.max.y * scale_y;
 
-                        // Slice the bounding box horizontally based on the fraction!
-                        let highlight_rect = egui::Rect::from_min_max(
-                            rect.min + egui::vec2(base_min_x + base_w * start_frac, y_min),
-                            rect.min + egui::vec2(base_min_x + base_w * end_frac, y_max),
-                        );
+                            egui::Rect::from_min_max(
+                                rect.min + egui::vec2(base_min_x, y_min),
+                                rect.min + egui::vec2(base_max_x, y_max),
+                            )
+                        } else {
+                            // Even the fallback is better now, because the word.rect has been
+                            // cleanly shrunken away from any icons!
+                            let start_frac = start_char_idx as f32 / total_chars as f32;
+                            let end_frac = end_char_idx as f32 / total_chars as f32;
 
-                        // Paint a glowing yellow box exactly over the sub-word
+                            let base_min_x = word.rect.min.x * scale_x;
+                            let base_w = word.rect.width() * scale_x;
+                            let y_min = word.rect.min.y * scale_y;
+                            let y_max = word.rect.max.y * scale_y;
+
+                            egui::Rect::from_min_max(
+                                rect.min + egui::vec2(base_min_x + base_w * start_frac, y_min),
+                                rect.min + egui::vec2(base_min_x + base_w * end_frac, y_max),
+                            )
+                        };
+
                         ui.painter().rect_filled(
                             highlight_rect,
                             2.0,
