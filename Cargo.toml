@@ -1,0 +1,14 @@
+[package]
+name = "clipboard_ocr"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.27"
+egui = "0.27"
+arboard = "3.4"
+image = "0.25"
+crossbeam-channel = "0.5"
+ocrs = "0.9"
+rten = "0.13"
+ureq = "2.9"
